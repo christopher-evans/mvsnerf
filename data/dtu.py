@@ -95,8 +95,8 @@ class MVSDatasetDTU(Dataset):
             world2cams += [extrinsic]
             cam2worlds += [np.linalg.inv(extrinsic)]
 
-        self.proj_mats, self.intrinsics = np.stack(proj_mats), np.stack(intrinsics)
-        self.world2cams, self.cam2worlds = np.stack(world2cams), np.stack(cam2worlds)
+        self.proj_mats, self.intrinsics = proj_mats, intrinsics
+        self.world2cams, self.cam2worlds = world2cams, cam2worlds
 
     def read_cam_file(self, filename):
         with open(filename) as f:
@@ -194,7 +194,7 @@ class MVSDatasetDTU(Dataset):
         affine_mat, affine_mat_inv = np.stack(affine_mat), np.stack(affine_mat_inv)
         intrinsics, w2cs, c2ws, near_fars = np.stack(intrinsics), np.stack(w2cs), np.stack(c2ws), np.stack(near_fars)
         view_ids_all = [target_view] + list(src_views) if type(src_views[0]) is not list else [j for sub in src_views for j in sub]
-        c2ws_all = self.cam2worlds[self.remap[view_ids_all]]
+        c2ws_all = np.array([self.cam2worlds[self.remap[i]] for i in view_ids_all])
 
         sample['images'] = imgs  # (V, H, W, 3)
         sample['depths_h'] = depths_h.astype(np.float32)  # (V, H, W)

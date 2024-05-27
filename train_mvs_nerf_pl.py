@@ -14,7 +14,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 
 # pytorch-lightning
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint, ModelSummary, RichProgressBar
 from pytorch_lightning import LightningModule, Trainer, loggers
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -51,6 +51,7 @@ class MVSSystem(LightningModule):
         self.render_kwargs_train['NDC_local'] = False
 
         self.eval_metric = [0.01,0.05, 0.1]
+        self.validation_step_outputs = []
 
 
     def decode_batch(self, batch, idx=list(torch.arange(4))):
@@ -97,7 +98,7 @@ class MVSSystem(LightningModule):
     def val_dataloader(self):
         return DataLoader(self.val_dataset,
                           shuffle=False,
-                          num_workers=1,
+                          num_workers=4,
                           batch_size=1,
                           pin_memory=True)
 
@@ -109,12 +110,11 @@ class MVSSystem(LightningModule):
         imgs, proj_mats = data_mvs['images'], data_mvs['proj_mats']
         near_fars, depths_h = data_mvs['near_fars'], data_mvs['depths_h']
 
-
         volume_feature, img_feat, depth_values = self.MVSNet(imgs[:, :3], proj_mats[:, :3], near_fars[0,0],pad=args.pad)
         imgs = self.unpreprocess(imgs)
 
 
-        N_rays, N_samples = args.batch_size, args.N_samples
+        N_rays, N_samples = 1024, args.N_samples
         c2ws, w2cs, intrinsics = pose_ref['c2ws'], pose_ref['w2cs'], pose_ref['intrinsics']
         rays_pts, rays_dir, target_s, rays_NDC, depth_candidates, rays_o, rays_depth, ndc_parameters = \
             build_rays(imgs, depths_h, pose_ref, w2cs, c2ws, intrinsics, near_fars, N_rays, N_samples, pad=args.pad)
@@ -150,8 +150,9 @@ class MVSSystem(LightningModule):
 
 
         if args.with_depth:
-            psnr = mse2psnr(img2mse(rgb.cpu()[mask], target_s.cpu()[mask]))
-            psnr_out = mse2psnr(img2mse(rgb.cpu()[~mask], target_s.cpu()[~mask]))
+            mask_cpu = mask.cpu()
+            psnr = mse2psnr(img2mse(rgb.cpu()[mask_cpu], target_s.cpu()[mask_cpu]))
+            psnr_out = mse2psnr(img2mse(rgb.cpu()[~mask_cpu], target_s.cpu()[~mask_cpu]))
             self.log('train/PSNR_out', psnr_out.item(), prog_bar=True)
         else:
             psnr = mse2psnr2(img_loss.item())
@@ -251,10 +252,11 @@ class MVSSystem(LightningModule):
             self.idx += 1
 
         del rays_NDC, rays_dir, rays_pts, volume_feature
+        self.validation_step_outputs.append(log)
         return log
 
-    def validation_epoch_end(self, outputs):
-
+    def on_validation_epoch_end(self):
+        outputs = self.validation_step_outputs
 
         mean_psnr = torch.stack([x['val_psnr'] for x in outputs]).mean()
         mask_sum = torch.stack([x['mask_sum'] for x in outputs]).sum()
@@ -263,6 +265,8 @@ class MVSSystem(LightningModule):
         mean_acc_1mm = torch.stack([x[f'val_acc_{self.eval_metric[0]}mm'] for x in outputs]).sum() / mask_sum
         mean_acc_2mm = torch.stack([x[f'val_acc_{self.eval_metric[1]}mm'] for x in outputs]).sum() / mask_sum
         mean_acc_4mm = torch.stack([x[f'val_acc_{self.eval_metric[2]}mm'] for x in outputs]).sum() / mask_sum
+
+        self.validation_step_outputs.clear()
 
         self.log('val/d_loss_r', mean_d_loss_r, prog_bar=False)
         self.log('val/PSNR', mean_psnr, prog_bar=False)
@@ -295,27 +299,27 @@ if __name__ == '__main__':
                                           monitor='val/PSNR',
                                           mode='max',
                                           save_top_k=0)
+    weights_callback = ModelSummary(max_depth=1)
+    progress_bar_callback = RichProgressBar(refresh_rate=1)
 
-    logger = loggers.TestTubeLogger(
+    logger = loggers.TensorBoardLogger(
         save_dir="runs_new",
-        name=args.expname,
-        debug=False,
-        create_git_tag=False
+        name=args.expname
     )
 
     args.num_gpus, args.use_amp = 1, False
     trainer = Trainer(max_epochs=args.num_epochs,
-                      checkpoint_callback=checkpoint_callback,
+                      enable_checkpointing=True,
+                      callbacks=[checkpoint_callback, weights_callback, progress_bar_callback],
                       logger=logger,
-                      weights_summary=None,
-                      progress_bar_refresh_rate=1,
-                      gpus=args.num_gpus,
-                      distributed_backend='ddp' if args.num_gpus > 1 else None,
+                      devices=args.num_gpus,
+                      strategy='ddp' if args.num_gpus > 1 else 'auto',
                       num_sanity_val_steps=1,
                       check_val_every_n_epoch = max(system.args.num_epochs//system.args.N_vis,1),
                       benchmark=True,
-                      precision=16 if args.use_amp else 32,
-                      amp_level='O1')
+                      plugins=[],
+                      precision=16 if args.use_amp else 32)
+                      #amp_level='O1')
 
     trainer.fit(system)
     system.save_ckpt()
